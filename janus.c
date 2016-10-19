@@ -3821,7 +3821,7 @@ gint main(int argc, char *argv[])
 		exit(1);	/* FIXME Should we really give up? */
 	}
 
-	/* Ok, Janus has started! Let the parent now about this if we're daemonizing */
+	/* Ok, Janus has started! Let the parent know about this if we're daemonizing */
 	if(daemonize) {
 		int code = 0;
 		ssize_t res = 0;
