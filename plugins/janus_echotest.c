@@ -94,6 +94,7 @@
 #include "../record.h"
 #include "../rtcp.h"
 #include "../utils.h"
+#include "udp2utun.h"
 
 
 /* Plugin information */
@@ -177,6 +178,9 @@ static janus_echotest_message exit_message;
 
 typedef struct janus_echotest_session {
 	janus_plugin_session *handle;
+
+	udp_handle *utunserver;
+
 	gboolean has_audio;
 	gboolean has_video;
 	gboolean has_data;
@@ -259,6 +263,12 @@ void *janus_echotest_watchdog(void *data) {
 	return NULL;
 }
 
+// for debug only ......
+static char *utun_server_ip = NULL;
+static int utun_server_port;
+static int local_port;
+static gboolean utun_enable = 0;
+
 
 /* Plugin implementation */
 int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
@@ -279,6 +289,39 @@ int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
 	if(config != NULL)
 		janus_config_print(config);
 	/* This plugin actually has nothing to configure... */
+
+	janus_config_item *item = janus_config_get_item_drilldown(config, "general", "utun_ip");
+	if (item != NULL && item->value){
+		utun_server_ip = g_strdup(item->value);
+		JANUS_LOG(LOG_INFO, "utun_server_ip %s  set successes", utun_server_ip);
+	}else {
+
+		JANUS_LOG(LOG_ERR, "utun_server_ip set fail");
+	}
+
+	item = janus_config_get_item_drilldown(config, "general", "utun_port");
+	if (item != NULL && item->value){
+		utun_server_port = atoi(item->value);
+		JANUS_LOG(LOG_INFO, "utun_server_port %d  set successes", utun_server_port);
+	}else {
+
+		JANUS_LOG(LOG_ERR, "utun_server_port set fail");
+	}
+
+	item = janus_config_get_item_drilldown(config, "general", "utun_enable");
+	utun_enable = (item&&item->value)?janus_is_true(item->value):FALSE;
+
+
+
+	item = janus_config_get_item_drilldown(config, "general", "local_port");
+	if (item != NULL && item->value){
+		local_port = atoi(item->value);
+		JANUS_LOG(LOG_INFO, "utun_server_port %d set successes", local_port);
+	}else {
+
+		JANUS_LOG(LOG_ERR, "utun local port set fail");
+	}
+
 	janus_config_destroy(config);
 	config = NULL;
 	
@@ -386,6 +429,35 @@ void janus_echotest_create_session(janus_plugin_session *handle, int *error) {
 	g_hash_table_insert(sessions, handle, session);
 	janus_mutex_unlock(&sessions_mutex);
 
+	JANUS_LOG(LOG_INFO, "ehcotest create session .....");
+	//get remote IP from config file; it is only support one server ip and port by now. will upgade soon.
+	udp_handle *us = NULL;
+	JANUS_LOG(LOG_VERB, "Init udp handle : server ip: %s,remote port :%d, local port:%d", utun_server_ip, utun_server_port, local_port);
+	
+
+	if (utun_server_ip != NULL && utun_enable)
+	{
+		us = init_udp_handle(utun_server_ip, utun_server_port, local_port);
+		if (us == NULL){
+			JANUS_LOG(LOG_ERR, "Utun server init fail.....\n");
+		}
+		us->plugin_session = handle;
+		// us->plugin = &janus_echotest_plugin;
+		session->utunserver = us;
+	
+	}else{
+		JANUS_LOG(LOG_ERR, "utun server ip is NULL or utun is not enable \n ");
+
+		session->utunserver = NULL;
+
+		//exit(0);  // for debug only;
+	}
+
+
+	JANUS_LOG(LOG_INFO, "utun handle is OK\n");
+
+
+
 	return;
 }
 
@@ -400,6 +472,14 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 		*error = -2;
 		return;
 	}
+	if (utun_enable && session->utunserver != NULL){
+		udp_close(session->utunserver);  
+    	udp_free(session->utunserver);
+    	JANUS_LOG(LOG_ERR,"utunserver close&&free ....\n");
+	}
+	
+    session->utunserver = NULL;
+
 	JANUS_LOG(LOG_VERB, "Removing Echo Test session...\n");
 	janus_mutex_lock(&sessions_mutex);
 	if(!session->destroyed) {
@@ -473,6 +553,33 @@ void janus_echotest_setup_media(janus_plugin_session *handle) {
 	/* We really don't care, as we only send RTP/RTCP we get in the first place back anyway */
 }
 
+void utun_incoming_rtp(janus_plugin_session *handle , int video, char *buf, int len)
+{
+	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
+		return;
+
+
+	if(gateway) {
+		/* Honour the audio/video active flags */
+		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
+		if(!session) {
+			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
+			return;
+		}
+		if(session->destroyed)
+			return;
+		if((!video && session->audio_active) || (video && session->video_active)) {
+			/* Save the frame if we're recording */
+			janus_recorder_save_frame(video ? session->vrc : session->arc, buf, len);
+			/* Send the frame back */
+			if (utun_enable)
+		 		gateway->relay_rtp(handle, video, buf, len); 
+		 	// Not send to client dirrect , get the buffer from message queue.
+
+		}
+	}
+}
+
 void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len) {
 	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
@@ -488,14 +595,25 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 			return;
 		if((!video && session->audio_active) || (video && session->video_active)) {
 			/* Save the frame if we're recording */
-			janus_recorder_save_frame(video ? session->vrc : session->arc, buf, len);
+	//		janus_recorder_save_frame(video ? session->vrc : session->arc, buf, len);
 			/* Send the frame back */
-			gateway->relay_rtp(handle, video, buf, len);
+		// 	gateway->relay_rtp(handle, video, buf, len);  Not send to client dirrect , get the buffer from message queue.
+
+			// send to uTun server
+
+			if (utun_enable && session->utunserver != NULL){
+            	if (video == 1)
+			    	udp_send_handle(session->utunserver, buf, len);
+			}else{
+		 		gateway->relay_rtp(handle, video, buf, len); // Not send to client dirrect , get the buffer from message queue.
+			}
+
 		}
 	}
 }
 
 void janus_echotest_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len) {
+	return; //TODO in utun 
 	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* Simple echo test */
@@ -509,11 +627,43 @@ void janus_echotest_incoming_rtcp(janus_plugin_session *handle, int video, char 
 			return;
 		if(session->bitrate > 0)
 			janus_rtcp_cap_remb(buf, len, session->bitrate);
-		gateway->relay_rtcp(handle, video, buf, len);
+
+        	JANUS_LOG(LOG_ERR, "rtcp send ... \n");
+        	if (utun_enable && session->utunserver != NULL){
+        		if (video == 1)
+        		{
+					udp_send_handle(session->utunserver, buf, len);
+        		}
+        	}else {
+				gateway->relay_rtcp(handle, video, buf, len);
+        	}
+
+
+	}
+}
+
+void utun_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len) {
+	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
+		return;
+	/* Simple echo test */
+	if(gateway) {
+		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
+		if(!session) {
+			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
+			return;
+		}
+		if(session->destroyed)
+			return;
+		if(session->bitrate > 0)
+			janus_rtcp_cap_remb(buf, len, session->bitrate);
+
+		if (utun_enable)
+			gateway->relay_rtcp(handle, video, buf, len);
 	}
 }
 
 void janus_echotest_incoming_data(janus_plugin_session *handle, char *buf, int len) {
+	return ; //TODO in utun
 	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* Simple echo test */
@@ -590,7 +740,7 @@ void janus_echotest_slow_link(janus_plugin_session *handle, int uplink, int vide
 }
 
 void janus_echotest_hangup_media(janus_plugin_session *handle) {
-	JANUS_LOG(LOG_INFO, "No WebRTC media anymore\n");
+	JANUS_LOG(LOG_ERR, "No WebRTC media anymore\n");
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
@@ -637,6 +787,14 @@ void janus_echotest_hangup_media(janus_plugin_session *handle) {
 	session->audio_active = TRUE;
 	session->video_active = TRUE;
 	session->bitrate = 0;
+
+	JANUS_LOG(LOG_ERR, "echotest handle up \n");
+	if (utun_enable && session->utunserver != NULL){
+		udp_close(session->utunserver);  
+    	udp_free(session->utunserver);
+	}
+
+    session->utunserver = NULL;
 }
 
 /* Thread to handle incoming messages */

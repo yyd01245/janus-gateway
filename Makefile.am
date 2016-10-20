@@ -226,7 +226,7 @@ endif
 
 if ENABLE_PLUGIN_ECHOTEST
 plugin_LTLIBRARIES += plugins/libjanus_echotest.la
-plugins_libjanus_echotest_la_SOURCES = plugins/janus_echotest.c
+plugins_libjanus_echotest_la_SOURCES = plugins/janus_echotest.c plugins/udp2utun.c
 plugins_libjanus_echotest_la_CFLAGS = $(plugins_cflags)
 plugins_libjanus_echotest_la_LDFLAGS = $(plugins_ldflags)
 plugins_libjanus_echotest_la_LIBADD = $(plugins_libadd)
